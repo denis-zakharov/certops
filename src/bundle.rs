@@ -3,6 +3,8 @@
 use std::fs;
 use std::path::Path;
 
+use crate::jks;
+
 use anyhow::{Context, Result, bail};
 use p12_keystore::{
     Certificate, KeyStore, KeyStoreEntry, Pkcs12ImportPolicy, PrivateKey, PrivateKeyChain,
@@ -25,11 +27,15 @@ pub struct Bundle {
 pub enum Format {
     Pem,
     Pkcs12,
+    Jks,
 }
 
-/// Detects the format by content: PEM is text with `-----BEGIN`, PKCS#12 is binary DER.
+/// Detects the format by content: JKS starts with a magic number, PEM is text with
+/// `-----BEGIN`, anything else is assumed to be PKCS#12 (binary DER).
 pub fn detect_format(data: &[u8]) -> Format {
-    if data.windows(10).any(|w| w == b"-----BEGIN") {
+    if data.starts_with(&crate::jks::MAGIC) {
+        Format::Jks
+    } else if data.windows(10).any(|w| w == b"-----BEGIN") {
         Format::Pem
     } else {
         Format::Pkcs12
@@ -56,6 +62,36 @@ impl Bundle {
             }
         }
         Ok(bundle)
+    }
+
+    pub fn from_jks(data: &[u8], password: &str) -> Result<Self> {
+        let jks = jks::parse(data, password)?;
+        let (key, chain) = match jks.key {
+            Some((k, c)) => (Some(k), c),
+            None => (None, vec![]),
+        };
+        Ok(Bundle {
+            key,
+            chain,
+            trusted: jks.trusted,
+        })
+    }
+
+    pub fn to_jks(&self, password: &str) -> Result<Vec<u8>> {
+        let key = match &self.key {
+            Some(_) if self.chain.is_empty() => {
+                bail!("a private key requires at least one certificate")
+            }
+            Some(k) => Some((k.clone(), self.chain.clone())),
+            None => None,
+        };
+        // Without a key, JKS has no place for a chain: keep those certificates as trusted entries.
+        let trusted = if key.is_some() {
+            self.trusted.clone()
+        } else {
+            self.all_certs().cloned().collect()
+        };
+        jks::write(&jks::Jks { key, trusted }, password)
     }
 
     /// Parses PEM text. Certificates go to the chain when a key is present, otherwise to `trusted`.
@@ -99,6 +135,7 @@ impl Bundle {
         match detect_format(&data) {
             Format::Pem => Self::from_pem(&data),
             Format::Pkcs12 => Self::from_pkcs12(&data, &password()?),
+            Format::Jks => Self::from_jks(&data, &password()?),
         }
     }
 

@@ -1,4 +1,5 @@
 mod bundle;
+mod jks;
 mod text;
 
 use std::fs;
@@ -6,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use bundle::{Bundle, Format, certs_to_pem, detect_format, key_to_pem};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
 #[command(
@@ -22,36 +23,52 @@ struct Cli {
 enum Command {
     /// Print human readable information about certificates in a keystore
     Text {
-        /// Keystore file (PEM or PKCS12)
+        /// Keystore file (PEM, PKCS12 or JKS)
         input: PathBuf,
         /// Print all available certificate information
         #[arg(long)]
         full: bool,
-        /// PKCS12 password (asked interactively if omitted)
+        /// Keystore password (asked interactively if omitted)
         #[arg(long)]
         password: Option<String>,
     },
-    /// Convert between PEM and PKCS12 (format is detected from the input content)
+    /// Convert between PEM, PKCS12 and JKS (input format is detected from its content)
     ///
-    /// PKCS12 -> PEM writes <output>.pem (everything), <output>.cl.pem (chain),
+    /// To PEM writes <output>.pem (everything), <output>.cl.pem (chain),
     /// <output>.ca.pem (trusted certificates, if any) and <output>.key.pem (private key).
-    /// PEM -> PKCS12 writes <output> as is.
+    /// To PKCS12 or JKS writes <output> as is.
+    ///
+    /// The target format is taken from --to, else from the output extension
+    /// (.jks, .p12/.pfx), else it is PKCS12 for PEM input and PEM otherwise.
     Export {
-        /// Input keystore (PEM or PKCS12)
+        /// Input keystore (PEM, PKCS12 or JKS)
         input: PathBuf,
-        /// Output file (PKCS12) or output prefix (PEM)
+        /// Output file (PKCS12, JKS) or output prefix (PEM)
         output: PathBuf,
-        /// PKCS12 password: used to read the input, or to protect the output
-        /// (asked interactively if omitted)
+        /// Target format
+        #[arg(long, value_enum)]
+        to: Option<Target>,
+        /// Password to read the input and, unless --out-password is given, to protect the
+        /// output (asked interactively if omitted)
         #[arg(long)]
         password: Option<String>,
-        /// PEM -> PKCS12: additional PEM file with the private key (e.g. <name>.key.pem)
+        /// Password protecting a PKCS12/JKS output
+        #[arg(long)]
+        out_password: Option<String>,
+        /// PEM input: additional PEM file with the private key (e.g. <name>.key.pem)
         #[arg(long)]
         key: Option<PathBuf>,
-        /// PEM -> PKCS12: additional PEM file with trusted certificates (e.g. <name>.ca.pem)
+        /// PEM input: additional PEM file with trusted certificates (e.g. <name>.ca.pem)
         #[arg(long)]
         ca: Option<PathBuf>,
     },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Target {
+    Pem,
+    P12,
+    Jks,
 }
 
 fn main() {
@@ -66,63 +83,84 @@ fn run(cli: Cli) -> Result<()> {
         Command::Text {
             input,
             full,
-            password,
+            mut password,
         } => {
-            let bundle = Bundle::load(&input, || ask_password(password, false))?;
+            let bundle = Bundle::load(&input, || ask_password(&mut password, false))?;
             print!("{}", text::render(&bundle, full)?);
         }
         Command::Export {
             input,
             output,
+            to,
             password,
+            out_password,
             key,
             ca,
-        } => export(&input, &output, password, key, ca)?,
+        } => export(&input, &output, to, password, out_password, key, ca)?,
     }
     Ok(())
+}
+
+fn infer_target(output: &Path, input: Format) -> Target {
+    match output.extension().and_then(|e| e.to_str()) {
+        Some("jks") => Target::Jks,
+        Some("p12" | "pfx") => Target::P12,
+        _ if input == Format::Pem => Target::P12,
+        _ => Target::Pem,
+    }
 }
 
 fn export(
     input: &Path,
     output: &Path,
+    to: Option<Target>,
     password: Option<String>,
+    out_password: Option<String>,
     key: Option<PathBuf>,
     ca: Option<PathBuf>,
 ) -> Result<()> {
     let data = fs::read(input).with_context(|| format!("cannot read {}", input.display()))?;
-    match detect_format(&data) {
-        Format::Pkcs12 => {
-            if key.is_some() || ca.is_some() {
-                bail!("--key and --ca only apply when converting PEM to PKCS12");
-            }
-            let bundle = Bundle::from_pkcs12(&data, &ask_password(password, false)?)?;
-            write_pem_files(&bundle, output)
-        }
-        Format::Pem => {
-            let mut bundle = Bundle::from_pem(&data)?;
-            // A bare PEM without a key holds only trusted certs; with --key they form the chain.
-            if let Some(path) = key {
-                let extra = Bundle::from_pem(&fs::read(path)?)?;
-                if extra.key.is_none() {
-                    bail!("no private key found in the --key file");
-                }
-                bundle.key = extra.key;
-                bundle.chain.append(&mut bundle.trusted);
-                bundle.chain.extend(extra.chain);
-                bundle.chain.extend(extra.trusted);
-            }
-            if let Some(path) = ca {
-                let extra = Bundle::from_pem(&fs::read(path)?)?;
-                bundle.trusted.extend(extra.trusted);
-                bundle.trusted.extend(extra.chain);
-            }
-            let password = ask_password(password, true)?;
-            fs::write(output, bundle.to_pkcs12(&password)?)
-                .with_context(|| format!("cannot write {}", output.display()))?;
-            println!("wrote {}", output.display());
-            Ok(())
-        }
+    let format = detect_format(&data);
+    let target = to.unwrap_or_else(|| infer_target(output, format));
+    if format != Format::Pem && (key.is_some() || ca.is_some()) {
+        bail!("--key and --ca only apply to PEM input");
     }
+
+    let mut in_password = password.clone();
+    let mut bundle = match format {
+        Format::Pkcs12 => Bundle::from_pkcs12(&data, &ask_password(&mut in_password, false)?)?,
+        Format::Jks => Bundle::from_jks(&data, &ask_password(&mut in_password, false)?)?,
+        Format::Pem => Bundle::from_pem(&data)?,
+    };
+    // A bare PEM without a key holds only trusted certs; with --key they form the chain.
+    if let Some(path) = key {
+        let extra = Bundle::from_pem(&fs::read(path)?)?;
+        if extra.key.is_none() {
+            bail!("no private key found in the --key file");
+        }
+        bundle.key = extra.key;
+        bundle.chain.append(&mut bundle.trusted);
+        bundle.chain.extend(extra.chain);
+        bundle.chain.extend(extra.trusted);
+    }
+    if let Some(path) = ca {
+        let extra = Bundle::from_pem(&fs::read(path)?)?;
+        bundle.trusted.extend(extra.trusted);
+        bundle.trusted.extend(extra.chain);
+    }
+
+    if target == Target::Pem {
+        return write_pem_files(&bundle, output);
+    }
+    let mut out_pw = out_password.or(password);
+    let out_pw = ask_password(&mut out_pw, true)?;
+    let encoded = match target {
+        Target::Jks => bundle.to_jks(&out_pw)?,
+        _ => bundle.to_pkcs12(&out_pw)?,
+    };
+    fs::write(output, encoded).with_context(|| format!("cannot write {}", output.display()))?;
+    println!("wrote {}", output.display());
+    Ok(())
 }
 
 fn write_pem_files(bundle: &Bundle, output: &Path) -> Result<()> {
@@ -166,11 +204,12 @@ fn write(path: &Path, content: &str) -> Result<()> {
     Ok(())
 }
 
-fn ask_password(given: Option<String>, confirm: bool) -> Result<String> {
+/// Returns the given password, or prompts for it (with confirmation when `confirm` is set).
+fn ask_password(given: &mut Option<String>, confirm: bool) -> Result<String> {
     if let Some(p) = given {
-        return Ok(p);
+        return Ok(p.clone());
     }
-    let p = rpassword::prompt_password("PKCS12 password: ")?;
+    let p = rpassword::prompt_password("Password: ")?;
     if confirm && p != rpassword::prompt_password("Confirm password: ")? {
         bail!("passwords do not match");
     }

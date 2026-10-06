@@ -112,3 +112,51 @@ fn export_writes_expected_files() {
     assert!(all.key.is_some());
     assert_eq!(all.chain.len(), 3);
 }
+
+#[test]
+fn jks_roundtrip() {
+    let (leaf, ca, key) = fixture();
+    let b = Bundle {
+        key: Some(key.clone()),
+        chain: vec![leaf.clone(), ca.clone()],
+        trusted: vec![ca.clone()],
+    };
+    let jks = b.to_jks("secret").unwrap();
+    assert_eq!(detect_format(&jks), Format::Jks);
+
+    let back = Bundle::from_jks(&jks, "secret").unwrap();
+    assert_eq!(back.key, Some(key));
+    assert_eq!(back.chain, vec![leaf, ca.clone()]);
+    assert_eq!(back.trusted, vec![ca]);
+    assert!(Bundle::from_jks(&jks, "wrong").is_err());
+
+    let mut tampered = jks.clone();
+    tampered[20] ^= 1;
+    assert!(Bundle::from_jks(&tampered, "secret").is_err());
+}
+
+#[test]
+fn jks_without_key_keeps_all_certs_as_trusted() {
+    let (leaf, ca, _) = fixture();
+    let b = Bundle {
+        key: None,
+        chain: vec![],
+        trusted: vec![leaf, ca],
+    };
+    let back = Bundle::from_jks(&b.to_jks("").unwrap(), "").unwrap();
+    assert!(back.key.is_none());
+    assert_eq!(back.trusted.len(), 2);
+}
+
+#[test]
+fn jks_pkcs12_conversion() {
+    let (leaf, ca, key) = fixture();
+    let b = Bundle {
+        key: Some(key),
+        chain: vec![leaf, ca],
+        trusted: vec![],
+    };
+    let via = Bundle::from_pkcs12(&b.to_pkcs12("a").unwrap(), "a").unwrap();
+    let back = Bundle::from_jks(&via.to_jks("b").unwrap(), "b").unwrap();
+    assert_eq!((back.key, back.chain), (b.key, b.chain));
+}
