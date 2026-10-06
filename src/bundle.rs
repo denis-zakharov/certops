@@ -9,6 +9,7 @@ use anyhow::{Context, Result, bail};
 use p12_keystore::{
     Certificate, KeyStore, KeyStoreEntry, Pkcs12ImportPolicy, PrivateKey, PrivateKeyChain,
 };
+use rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use x509_parser::parse_x509_certificate;
 
@@ -95,7 +96,18 @@ impl Bundle {
     }
 
     /// Parses PEM text. Certificates go to the chain when a key is present, otherwise to `trusted`.
+    #[cfg(test)]
     pub fn from_pem(data: &[u8]) -> Result<Self> {
+        Self::from_pem_with(data, &mut || {
+            bail!("the PEM private key is encrypted but no password is available")
+        })
+    }
+
+    /// Like `from_pem`; `password` is called only if an encrypted key is found.
+    pub fn from_pem_with(
+        data: &[u8],
+        password: &mut dyn FnMut() -> Result<String>,
+    ) -> Result<Self> {
         let mut certs = Vec::new();
         let mut key = None;
         for block in pem::parse_many(data).context("invalid PEM")? {
@@ -105,7 +117,12 @@ impl Bundle {
                 }
                 "PRIVATE KEY" => key = Some(block.into_contents()),
                 "ENCRYPTED PRIVATE KEY" => {
-                    bail!("encrypted PEM private keys are not supported; decrypt the key first")
+                    let info = pkcs8::EncryptedPrivateKeyInfo::try_from(block.contents())
+                        .map_err(|e| anyhow::anyhow!("invalid encrypted private key: {e}"))?;
+                    let doc = info.decrypt(password()?).map_err(|e| {
+                        anyhow::anyhow!("cannot decrypt the private key (wrong password?): {e}")
+                    })?;
+                    key = Some(doc.as_bytes().to_vec());
                 }
                 "RSA PRIVATE KEY" | "EC PRIVATE KEY" => {
                     bail!(
@@ -130,10 +147,10 @@ impl Bundle {
         })
     }
 
-    pub fn load(path: &Path, password: impl FnOnce() -> Result<String>) -> Result<Self> {
+    pub fn load(path: &Path, mut password: impl FnMut() -> Result<String>) -> Result<Self> {
         let data = fs::read(path).with_context(|| format!("cannot read {}", path.display()))?;
         match detect_format(&data) {
-            Format::Pem => Self::from_pem(&data),
+            Format::Pem => Self::from_pem_with(&data, &mut password),
             Format::Pkcs12 => Self::from_pkcs12(&data, &password()?),
             Format::Jks => Self::from_jks(&data, &password()?),
         }
@@ -185,6 +202,26 @@ pub fn certs_to_pem<'a>(certs: impl IntoIterator<Item = &'a Vec<u8>>) -> String 
 
 pub fn key_to_pem(key: &[u8]) -> String {
     pem::encode(&pem::Pem::new("PRIVATE KEY", key.to_vec()))
+}
+
+/// Encrypts a PKCS#8 key (PBES2: PBKDF2-HMAC-SHA256 + AES-256-CBC) into an
+/// `ENCRYPTED PRIVATE KEY` PEM block.
+pub fn key_to_encrypted_pem(key: &[u8], password: &str) -> Result<String> {
+    let info = pkcs8::PrivateKeyInfo::try_from(key)
+        .map_err(|e| anyhow::anyhow!("invalid PKCS#8 private key: {e}"))?;
+    let mut salt = [0u8; 16];
+    let mut iv = [0u8; 16];
+    OsRng.fill_bytes(&mut salt);
+    OsRng.fill_bytes(&mut iv);
+    let params = pkcs8::pkcs5::pbes2::Parameters::pbkdf2_sha256_aes256cbc(600_000, &salt, &iv)
+        .map_err(|e| anyhow::anyhow!("invalid encryption parameters: {e}"))?;
+    let doc = info
+        .encrypt_with_params(params, password)
+        .map_err(|e| anyhow::anyhow!("cannot encrypt the private key: {e}"))?;
+    Ok(pem::encode(&pem::Pem::new(
+        "ENCRYPTED PRIVATE KEY",
+        doc.as_bytes().to_vec(),
+    )))
 }
 
 /// Orders certificates leaf → root by following issuer links. Falls back to input order

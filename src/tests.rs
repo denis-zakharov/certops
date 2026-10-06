@@ -103,7 +103,7 @@ fn export_writes_expected_files() {
         trusted: vec![ca],
     };
     let dir = tempfile::tempdir().unwrap();
-    write_pem_files(&b, &dir.path().join("out.pem")).unwrap();
+    write_pem_files(&b, &dir.path().join("out.pem"), None).unwrap();
     for f in ["out.pem", "out.cl.pem", "out.ca.pem", "out.key.pem"] {
         assert!(dir.path().join(f).exists(), "{f} missing");
     }
@@ -159,4 +159,27 @@ fn jks_pkcs12_conversion() {
     let via = Bundle::from_pkcs12(&b.to_pkcs12("a").unwrap(), "a").unwrap();
     let back = Bundle::from_jks(&via.to_jks("b").unwrap(), "b").unwrap();
     assert_eq!((back.key, back.chain), (b.key, b.chain));
+}
+
+#[test]
+fn encrypted_pem_key_roundtrip() {
+    let (leaf, ca, key) = fixture();
+    let b = Bundle {
+        key: Some(key.clone()),
+        chain: vec![leaf, ca],
+        trusted: vec![],
+    };
+    let dir = tempfile::tempdir().unwrap();
+    write_pem_files(&b, &dir.path().join("enc"), Some("s3cret")).unwrap();
+    for f in ["enc.pem", "enc.key.pem"] {
+        let text = std::fs::read_to_string(dir.path().join(f)).unwrap();
+        assert!(text.contains("BEGIN ENCRYPTED PRIVATE KEY"), "{f}");
+        assert!(!text.contains("BEGIN PRIVATE KEY"), "{f}");
+    }
+    let data = std::fs::read(dir.path().join("enc.pem")).unwrap();
+    assert!(Bundle::from_pem(&data).is_err());
+    assert!(Bundle::from_pem_with(&data, &mut || Ok("wrong".into())).is_err());
+    let back = Bundle::from_pem_with(&data, &mut || Ok("s3cret".into())).unwrap();
+    assert_eq!(back.key, Some(key));
+    assert_eq!(back.chain.len(), 2);
 }

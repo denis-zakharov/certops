@@ -6,7 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use bundle::{Bundle, Format, certs_to_pem, detect_format, key_to_pem};
+use bundle::{Bundle, Format, certs_to_pem, detect_format, key_to_encrypted_pem, key_to_pem};
 use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
@@ -55,6 +55,10 @@ enum Command {
         /// Password protecting a PKCS12/JKS output
         #[arg(long)]
         out_password: Option<String>,
+        /// PEM output: write the private key unencrypted (default: encrypted with the
+        /// output password)
+        #[arg(long)]
+        noenc: bool,
         /// PEM input: additional PEM file with the private key (e.g. <name>.key.pem)
         #[arg(long)]
         key: Option<PathBuf>,
@@ -94,9 +98,10 @@ fn run(cli: Cli) -> Result<()> {
             to,
             password,
             out_password,
+            noenc,
             key,
             ca,
-        } => export(&input, &output, to, password, out_password, key, ca)?,
+        } => export(&input, &output, to, password, out_password, noenc, key, ca)?,
     }
     Ok(())
 }
@@ -110,12 +115,14 @@ fn infer_target(output: &Path, input: Format) -> Target {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn export(
     input: &Path,
     output: &Path,
     to: Option<Target>,
     password: Option<String>,
     out_password: Option<String>,
+    noenc: bool,
     key: Option<PathBuf>,
     ca: Option<PathBuf>,
 ) -> Result<()> {
@@ -125,16 +132,20 @@ fn export(
     if format != Format::Pem && (key.is_some() || ca.is_some()) {
         bail!("--key and --ca only apply to PEM input");
     }
+    if noenc && target != Target::Pem {
+        bail!("--noenc only applies to PEM output");
+    }
 
     let mut in_password = password.clone();
+    let mut ask_in = || ask_password(&mut in_password, false);
     let mut bundle = match format {
-        Format::Pkcs12 => Bundle::from_pkcs12(&data, &ask_password(&mut in_password, false)?)?,
-        Format::Jks => Bundle::from_jks(&data, &ask_password(&mut in_password, false)?)?,
-        Format::Pem => Bundle::from_pem(&data)?,
+        Format::Pkcs12 => Bundle::from_pkcs12(&data, &ask_in()?)?,
+        Format::Jks => Bundle::from_jks(&data, &ask_in()?)?,
+        Format::Pem => Bundle::from_pem_with(&data, &mut ask_in)?,
     };
     // A bare PEM without a key holds only trusted certs; with --key they form the chain.
     if let Some(path) = key {
-        let extra = Bundle::from_pem(&fs::read(path)?)?;
+        let extra = Bundle::from_pem_with(&fs::read(path)?, &mut ask_in)?;
         if extra.key.is_none() {
             bail!("no private key found in the --key file");
         }
@@ -144,15 +155,20 @@ fn export(
         bundle.chain.extend(extra.trusted);
     }
     if let Some(path) = ca {
-        let extra = Bundle::from_pem(&fs::read(path)?)?;
+        let extra = Bundle::from_pem_with(&fs::read(path)?, &mut ask_in)?;
         bundle.trusted.extend(extra.trusted);
         bundle.trusted.extend(extra.chain);
     }
 
-    if target == Target::Pem {
-        return write_pem_files(&bundle, output);
-    }
     let mut out_pw = out_password.or(password);
+    if target == Target::Pem {
+        let key_pw = if bundle.key.is_some() && !noenc {
+            Some(ask_password(&mut out_pw, true)?)
+        } else {
+            None
+        };
+        return write_pem_files(&bundle, output, key_pw.as_deref());
+    }
     let out_pw = ask_password(&mut out_pw, true)?;
     let encoded = match target {
         Target::Jks => bundle.to_jks(&out_pw)?,
@@ -163,7 +179,12 @@ fn export(
     Ok(())
 }
 
-fn write_pem_files(bundle: &Bundle, output: &Path) -> Result<()> {
+/// Writes the PEM file set; the private key is encrypted when `key_password` is given.
+fn write_pem_files(bundle: &Bundle, output: &Path, key_password: Option<&str>) -> Result<()> {
+    let key_pem = |k: &[u8]| match key_password {
+        Some(pw) => key_to_encrypted_pem(k, pw),
+        None => Ok(key_to_pem(k)),
+    };
     // Accept both "name" and "name.pem" as prefix.
     let prefix = match output.extension().and_then(|e| e.to_str()) {
         Some("pem") => output.with_extension(""),
@@ -177,7 +198,7 @@ fn write_pem_files(bundle: &Bundle, output: &Path) -> Result<()> {
 
     let mut all = String::new();
     if let Some(k) = &bundle.key {
-        all.push_str(&key_to_pem(k));
+        all.push_str(&key_pem(k)?);
     }
     all.push_str(&certs_to_pem(bundle.all_certs()));
     write(&named(".pem"), &all)?;
@@ -188,7 +209,7 @@ fn write_pem_files(bundle: &Bundle, output: &Path) -> Result<()> {
         write(&named(".ca.pem"), &certs_to_pem(&bundle.trusted))?;
     }
     if let Some(k) = &bundle.key {
-        write(&named(".key.pem"), &key_to_pem(k))?;
+        write(&named(".key.pem"), &key_pem(k)?)?;
     }
     Ok(())
 }
@@ -213,6 +234,7 @@ fn ask_password(given: &mut Option<String>, confirm: bool) -> Result<String> {
     if confirm && p != rpassword::prompt_password("Confirm password: ")? {
         bail!("passwords do not match");
     }
+    *given = Some(p.clone());
     Ok(p)
 }
 

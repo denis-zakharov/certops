@@ -39,7 +39,7 @@ Converting **to PEM** writes several files, with `<output>` as a prefix (`out` a
 | `<output>.pem` | everything: private key, chain and trusted certificates |
 | `<output>.cl.pem` | certificate chain (leaf first) |
 | `<output>.ca.pem` | trusted (standalone CA) certificates, only if any |
-| `<output>.key.pem` | private key (PKCS#8), created with mode `0600` |
+| `<output>.key.pem` | private key (PKCS#8, encrypted unless `--noenc`), created with mode `0600` |
 
 Converting **to PKCS12 or JKS** writes `<output>` as is. The target format comes from `--to pem|p12|jks`;
 without it, from the output extension (`.jks`, `.p12`/`.pfx`); otherwise PEM input becomes PKCS12 and
@@ -49,6 +49,7 @@ everything else becomes PEM.
 |--------|---------|
 | `--password` | password to read the input and, by default, to protect the output (asked interactively if omitted) |
 | `--out-password` | separate password for a PKCS12/JKS output |
+| `--noenc` | PEM output: write the private key unencrypted (default: encrypted with the output password) |
 | `--key FILE` | PEM input only: file with the private key, e.g. `out.key.pem` |
 | `--ca FILE` | PEM input only: file with trusted certificates, e.g. `out.ca.pem` |
 
@@ -58,8 +59,9 @@ A keystore is treated as **one private key + its certificate chain + any number 
 
 - A file with more than one private key is rejected.
 - Aliases are not preserved; generated ones are used (`key`, `ca-1`, ...).
-- PEM keys must be unencrypted PKCS#8 (`BEGIN PRIVATE KEY`). For `RSA PRIVATE KEY` / `EC PRIVATE KEY`
-  run `openssl pkcs8 -topk8 -nocrypt`; encrypted PEM keys are not supported.
+- PEM keys must be PKCS#8: plain (`BEGIN PRIVATE KEY`) or encrypted (`BEGIN ENCRYPTED PRIVATE KEY`, PBES2).
+  The password is asked when needed. For `RSA PRIVATE KEY` / `EC PRIVATE KEY` run
+  `openssl pkcs8 -topk8 -nocrypt`.
 - JKS uses the store password as the key password (the `keytool` default). JCEKS is not supported.
 - Without a private key, PEM certificates are treated as trusted certificates.
 
